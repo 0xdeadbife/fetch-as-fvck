@@ -1,0 +1,20 @@
+# Sample URLs for testing batch processing
+# Lines starting with # are ignored
+
+# Popular JS libraries
+https://cdnjs.cloudflare.com/ajax/libs/jquery/3.6.0/jquery.min.js
+https://cdnjs.cloudflare.com/ajax/libs/axios/0.21.1/axios.min.js
+https://cdnjs.cloudflare.com/ajax/libs/lodash.js/4.17.21/lodash.min.js
+
+# Frontend frameworks
+https://cdnjs.cloudflare.com/ajax/libs/react/17.0.2/umd/react.development.js
+https://cdnjs.cloudflare.com/ajax/libs/vue/3.2.31/vue.global.js
+https://cdnjs.cloudflare.com/ajax/libs/angular.js/1.8.2/angular.min.js
+
+# Utility libraries  
+https://cdnjs.cloudflare.com/ajax/libs/moment.js/2.29.1/moment.min.js
+https://cdnjs.cloudflare.com/ajax/libs/underscore.js/1.13.1/underscore-min.js
+
+# Local files (these would fail but show error handling)
+./test_sample.js
+/nonexistent/file.js

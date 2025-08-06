@@ -1,0 +1,1095 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+JavaScript API Endpoint Extractor
+
+A framework-agnostic tool to extract API endpoints and HTTP requests from JavaScript code
+using esprima2 for AST analysis. Supports modern frameworks and libraries.
+
+Features:
+- Native fetch() and XMLHttpRequest detection
+- Library support: axios, jQuery, superagent, ky, got
+- Framework support: React hooks, Vue.js, Angular HTTP
+- Dynamic URL reconstruction from variables and template literals
+- Filters out false positives (non-HTTP URLs, file paths, etc.)
+
+Usage:
+    python extract_endpoints.py <url_or_file.js> [url_or_file2.js ...]
+    python extract_endpoints.py -
+    echo "https://example.com/js/main.js" | python extract_endpoints.py -
+
+Examples:
+    python extract_endpoints.py app.js
+    python extract_endpoints.py https://example.com/js/main.js
+    python extract_endpoints.py file1.js file2.js file3.js
+    echo "https://example.com/js/main.js" | python extract_endpoints.py -
+    cat urls.txt | python extract_endpoints.py -
+"""
+
+import sys
+import re
+import logging
+import argparse
+import json
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import List, Set, Dict, Any, Optional
+from urllib.parse import urljoin, urlparse
+from urllib.request import urlopen, Request
+from urllib.error import URLError
+import esprima
+from esprima import nodes
+
+# Rich imports for beautiful output
+from rich.console import Console
+from rich.table import Table
+from rich.panel import Panel
+from rich.columns import Columns
+from rich.text import Text
+from rich.tree import Tree
+from rich.progress import Progress, SpinnerColumn, TextColumn
+from rich.syntax import Syntax
+from rich import box
+from rich.markdown import Markdown
+
+
+# Configure rich console
+console = Console()
+
+# Configure logging to be less verbose
+logging.basicConfig(level=logging.WARNING, format='%(levelname)s: %(message)s')
+logger = logging.getLogger(__name__)
+
+
+class EndpointExtractor:
+    """Extracts API endpoints from JavaScript AST using various detection patterns."""
+    
+    def __init__(self):
+        self.endpoints: Set[str] = set()
+        self.variables: Dict[str, str] = {}  # Track variable assignments for URL reconstruction
+        self.constants: Dict[str, str] = {}  # Track const declarations
+        self.base_urls: Set[str] = set()  # Track base URLs
+        self.api_calls: List[Dict[str, Any]] = []  # Track API calls with context
+        
+        # Common API-related patterns
+        self.api_patterns = {
+            # Native fetch and XHR
+            'fetch_calls': ['fetch'],
+            'xhr_methods': ['open', 'send'],
+            
+            # Popular HTTP libraries
+            'axios_methods': ['get', 'post', 'put', 'delete', 'patch', 'head', 'options', 'request'],
+            'jquery_ajax': ['ajax', 'get', 'post', 'put', 'delete', 'getJSON', 'load'],
+            'superagent_methods': ['get', 'post', 'put', 'del', 'patch', 'head'],
+            
+            # Framework-specific patterns
+            'react_hooks': ['useFetch', 'useQuery', 'useMutation', 'useApi'],
+            'vue_methods': ['$http', '$get', '$post', '$put', '$delete'],
+            'angular_http': ['get', 'post', 'put', 'delete', 'patch', 'head', 'options'],
+            
+            # Common API route patterns
+            'api_routes': ['/api/', '/v1/', '/v2/', '/rest/', '/graphql'],
+        }
+    
+    def extract_from_ast(self, ast: Any) -> Dict[str, Any]:
+        """Main extraction method that traverses the AST."""
+        self._traverse_node(ast)
+        endpoints = sorted(list(self.endpoints))
+        
+        return {
+            'endpoints': endpoints,
+            'categorized': self._categorize_endpoints(endpoints),
+            'base_urls': sorted(list(self.base_urls)),
+            'total_count': len(endpoints)
+        }
+    
+    def extract_from_source_regex(self, js_code: str) -> Set[str]:
+        """Fallback regex extraction for cases where AST parsing misses endpoints."""
+        found_endpoints = set()
+        
+        # Regex patterns to find potential endpoints
+        patterns = [
+            r'["\'](/api/[^"\']*)["\']',           # /api/ paths
+            r'["\'](/v\d+/[^"\']*)["\']',          # Versioned APIs  
+            r'["\'](/graphql[^"\']*)["\']',        # GraphQL
+            r'["\'](/auth[^"\']*)["\']',           # Auth endpoints
+            r'["\'](/login[^"\']*)["\']',          # Login
+            r'["\'](/logout[^"\']*)["\']',         # Logout
+            r'["\'](/users[^"\']*)["\']',          # Users
+            r'["\'](/functional-pillars[^"\']*)["\']', # Functional pillars
+            r'["\'](/classifications[^"\']*)["\']', # Classifications
+            r'["\'](/collections[^"\']*)["\']',    # Collections
+            r'["\'](/sso/[^"\']*)["\']',           # SSO
+            r'["\']([^"\']*\.json)["\']',          # JSON files
+            r'["\']([^"\']*\.xml)["\']',           # XML files
+            r'["\']([^"\']*\.php)["\']',           # PHP files
+            r'["\']([^"\']*\.asp[x]?)["\']',       # ASP files
+            # Full URLs
+            r'["\'](https?://[^"\']+)["\']',       # HTTPS URLs
+        ]
+        
+        for pattern in patterns:
+            matches = re.findall(pattern, js_code, re.IGNORECASE)
+            for match in matches:
+                if self._is_likely_endpoint(match):
+                    found_endpoints.add(match)
+        
+        return found_endpoints
+    
+    def _categorize_endpoints(self, endpoints: List[str]) -> Dict[str, List[str]]:
+        """Categorize endpoints by type for better organization."""
+        categories = {
+            'api_endpoints': [],
+            'rest_endpoints': [],
+            'graphql_endpoints': [],
+            'auth_endpoints': [],
+            'static_resources': [],
+            'external_apis': [],
+            'local_development': [],
+            'dynamic_endpoints': []
+        }
+        
+        for endpoint in endpoints:
+            # GraphQL
+            if 'graphql' in endpoint.lower():
+                categories['graphql_endpoints'].append(endpoint)
+            # Authentication
+            elif any(auth in endpoint.lower() for auth in ['auth', 'login', 'logout', 'token', 'session']):
+                categories['auth_endpoints'].append(endpoint)
+            # REST patterns
+            elif re.search(r'/rest/|/api/v\d+/', endpoint, re.IGNORECASE):
+                categories['rest_endpoints'].append(endpoint)
+            # Static resources
+            elif re.search(r'\.(json|xml|csv|pdf|txt)$', endpoint, re.IGNORECASE):
+                categories['static_resources'].append(endpoint)
+            # External APIs (with domain)
+            elif endpoint.startswith('https://') and not 'localhost' in endpoint:
+                categories['external_apis'].append(endpoint)
+            # Local development
+            elif 'localhost' in endpoint or endpoint.startswith('http://'):
+                categories['local_development'].append(endpoint)
+            # Dynamic (with placeholders)
+            elif '${' in endpoint or '...' in endpoint:
+                categories['dynamic_endpoints'].append(endpoint)
+            # General API endpoints
+            elif '/api/' in endpoint.lower() or endpoint.startswith('/'):
+                categories['api_endpoints'].append(endpoint)
+            else:
+                categories['api_endpoints'].append(endpoint)
+        
+        # Remove empty categories
+        return {k: v for k, v in categories.items() if v}
+    
+    def _traverse_node(self, node: Any) -> None:
+        """Recursively traverse AST nodes."""
+        if not hasattr(node, 'type'):
+            return
+            
+        # Handle different node types
+        if node.type == 'CallExpression':
+            self._handle_call_expression(node)
+        elif node.type == 'VariableDeclaration':
+            self._handle_variable_declaration(node)
+        elif node.type == 'AssignmentExpression':
+            self._handle_assignment_expression(node)
+        elif node.type == 'MemberExpression':
+            self._handle_member_expression(node)
+        elif node.type == 'NewExpression':
+            self._handle_new_expression(node)
+        elif node.type == 'Literal':
+            # Check literal strings for potential endpoints
+            self._check_literal_for_endpoint(node)
+        
+        # Traverse child nodes using proper AST structure
+        self._traverse_children(node)
+    
+    def _traverse_children(self, node: Any) -> None:
+        """Traverse child nodes properly."""
+        # Use esprima's node structure to traverse children
+        if hasattr(node, 'body') and node.body is not None:
+            if isinstance(node.body, list):
+                for child in node.body:
+                    if child is not None:
+                        self._traverse_node(child)
+            else:
+                self._traverse_node(node.body)
+        
+        if hasattr(node, 'declarations') and node.declarations is not None:
+            for decl in node.declarations:
+                if decl is not None:
+                    self._traverse_node(decl)
+        
+        if hasattr(node, 'init') and node.init is not None:
+            self._traverse_node(node.init)
+        
+        if hasattr(node, 'left') and node.left is not None:
+            self._traverse_node(node.left)
+        
+        if hasattr(node, 'right') and node.right is not None:
+            self._traverse_node(node.right)
+        
+        if hasattr(node, 'callee') and node.callee is not None:
+            self._traverse_node(node.callee)
+        
+        if hasattr(node, 'arguments') and node.arguments is not None:
+            for arg in node.arguments:
+                if arg is not None:
+                    self._traverse_node(arg)
+        
+        if hasattr(node, 'object') and node.object is not None:
+            self._traverse_node(node.object)
+        
+        if hasattr(node, 'property') and node.property is not None:
+            self._traverse_node(node.property)
+        
+        if hasattr(node, 'properties') and node.properties is not None:
+            for prop in node.properties:
+                if prop is not None:
+                    self._traverse_node(prop)
+        
+        if hasattr(node, 'key') and node.key is not None:
+            self._traverse_node(node.key)
+        
+        if hasattr(node, 'value') and node.value is not None:
+            self._traverse_node(node.value)
+        
+        if hasattr(node, 'expressions') and node.expressions is not None:
+            for expr in node.expressions:
+                if expr is not None:
+                    self._traverse_node(expr)
+        
+        if hasattr(node, 'quasis') and node.quasis is not None:
+            for quasi in node.quasis:
+                if quasi is not None:
+                    self._traverse_node(quasi)
+        
+        if hasattr(node, 'consequent') and node.consequent is not None:
+            self._traverse_node(node.consequent)
+        
+        if hasattr(node, 'alternate') and node.alternate is not None:
+            self._traverse_node(node.alternate)
+        
+        if hasattr(node, 'test') and node.test is not None:
+            self._traverse_node(node.test)
+    
+    def _check_literal_for_endpoint(self, node: Any) -> None:
+        """Check if a literal value is a potential endpoint."""
+        if hasattr(node, 'value') and isinstance(node.value, str):
+            url = node.value
+            if self._is_likely_endpoint(url):
+                self.endpoints.add(url)
+    
+    def _handle_call_expression(self, node: Any) -> None:
+        """Handle function call expressions."""
+        if not hasattr(node, 'callee'):
+            return
+            
+        callee = node.callee
+        args = getattr(node, 'arguments', [])
+        
+        # Direct function calls like fetch()
+        if hasattr(callee, 'name'):
+            self._check_direct_function_call(callee.name, args)
+        
+        # Member expressions like axios.get(), $.ajax(), string.concat()
+        elif hasattr(callee, 'type') and callee.type == 'MemberExpression':
+            self._check_member_function_call(callee, args)
+            # Special handling for .concat() method calls
+            if hasattr(callee, 'property') and hasattr(callee.property, 'name') and callee.property.name == 'concat':
+                self._handle_concat_call(callee, args)
+    
+    def _check_direct_function_call(self, func_name: str, args: List[Any]) -> None:
+        """Check direct function calls for API patterns."""
+        if func_name in self.api_patterns['fetch_calls']:
+            self._extract_from_args(args, 'fetch')
+        elif func_name in self.api_patterns['react_hooks']:
+            self._extract_from_args(args, 'hook')
+    
+    def _check_member_function_call(self, callee: Any, args: List[Any]) -> None:
+        """Check member function calls for API patterns."""
+        if not hasattr(callee, 'property') or not hasattr(callee.property, 'name'):
+            return
+            
+        method_name = callee.property.name
+        object_name = self._get_object_name(callee.object)
+        
+        # Check for various library patterns
+        if self._is_axios_call(object_name, method_name):
+            self._extract_from_args(args, 'axios')
+        elif self._is_jquery_call(object_name, method_name):
+            self._extract_from_args(args, 'jquery')
+        elif self._is_xhr_call(object_name, method_name):
+            self._extract_from_args(args, 'xhr')
+        elif self._is_superagent_call(object_name, method_name):
+            self._extract_from_args(args, 'superagent')
+        elif self._is_angular_http_call(object_name, method_name):
+            self._extract_from_args(args, 'angular')
+    
+    def _is_axios_call(self, obj: str, method: str) -> bool:
+        """Check if this is an axios call."""
+        return (obj == 'axios' or obj.endswith('axios')) and method in self.api_patterns['axios_methods']
+    
+    def _is_jquery_call(self, obj: str, method: str) -> bool:
+        """Check if this is a jQuery AJAX call."""
+        return obj in ['$', 'jQuery', 'jquery'] and method in self.api_patterns['jquery_ajax']
+    
+    def _is_xhr_call(self, obj: str, method: str) -> bool:
+        """Check if this is an XMLHttpRequest call."""
+        return 'XMLHttpRequest' in obj and method in self.api_patterns['xhr_methods']
+    
+    def _is_superagent_call(self, obj: str, method: str) -> bool:
+        """Check if this is a superagent call."""
+        return 'superagent' in obj.lower() and method in self.api_patterns['superagent_methods']
+    
+    def _is_angular_http_call(self, obj: str, method: str) -> bool:
+        """Check if this is an Angular HTTP call."""
+        return ('http' in obj.lower() or obj == '$http') and method in self.api_patterns['angular_http']
+    
+    def _get_object_name(self, obj: Any) -> str:
+        """Extract object name from various expression types."""
+        if hasattr(obj, 'name'):
+            return obj.name
+        elif hasattr(obj, 'type') and obj.type == 'MemberExpression':
+            # Handle chained calls like window.axios
+            if hasattr(obj.property, 'name'):
+                return obj.property.name
+        return ''
+    
+    def _extract_from_args(self, args: List[Any], call_type: str) -> None:
+        """Extract endpoints from function arguments."""
+        if not args:
+            return
+            
+        first_arg = args[0]
+        
+        # String literal URL
+        if hasattr(first_arg, 'type') and first_arg.type == 'Literal':
+            url = self._extract_literal_value(first_arg)
+            if url and self._is_likely_endpoint(url):
+                self.endpoints.add(url)
+        
+        # Template literal URL
+        elif hasattr(first_arg, 'type') and first_arg.type == 'TemplateLiteral':
+            url = self._reconstruct_template_literal(first_arg)
+            if url and self._is_likely_endpoint(url):
+                self.endpoints.add(url)
+        
+        # Binary expression (string concatenation)
+        elif hasattr(first_arg, 'type') and first_arg.type == 'BinaryExpression':
+            url = self._reconstruct_binary_expression(first_arg)
+            if url and self._is_likely_endpoint(url):
+                self.endpoints.add(url)
+        
+        # Variable reference
+        elif hasattr(first_arg, 'type') and first_arg.type == 'Identifier':
+            var_name = first_arg.name
+            if var_name in self.variables:
+                url = self.variables[var_name]
+                if self._is_likely_endpoint(url):
+                    self.endpoints.add(url)
+            elif var_name in self.constants:
+                url = self.constants[var_name]
+                if self._is_likely_endpoint(url):
+                    self.endpoints.add(url)
+        
+        # Object with url property (common in axios, jQuery)
+        elif hasattr(first_arg, 'type') and first_arg.type == 'ObjectExpression':
+            self._extract_from_object_expression(first_arg)
+    
+    def _extract_literal_value(self, node: Any) -> Optional[str]:
+        """Extract string value from literal node."""
+        if hasattr(node, 'value') and isinstance(node.value, str):
+            return node.value
+        return None
+    
+    def _reconstruct_template_literal(self, node: Any) -> Optional[str]:
+        """Reconstruct URL from template literal."""
+        if not hasattr(node, 'quasis') or not hasattr(node, 'expressions'):
+            return None
+            
+        result = ''
+        quasis = node.quasis
+        expressions = node.expressions
+        
+        for i, quasi in enumerate(quasis):
+            if hasattr(quasi, 'value') and hasattr(quasi.value, 'cooked'):
+                result += quasi.value.cooked
+            
+            # Add expression placeholder or try to resolve
+            if i < len(expressions):
+                expr = expressions[i]
+                if hasattr(expr, 'type') and expr.type == 'Identifier':
+                    # Try to resolve variable
+                    var_name = expr.name
+                    if var_name in self.variables:
+                        result += self.variables[var_name]
+                    elif var_name in self.constants:
+                        result += self.constants[var_name]
+                    else:
+                        result += f'${{{var_name}}}'  # Keep placeholder
+                elif hasattr(expr, 'type') and expr.type == 'Literal':
+                    result += str(expr.value)
+                else:
+                    result += '${...}'  # Generic placeholder
+        
+        return result
+    
+    def _reconstruct_binary_expression(self, node: Any) -> Optional[str]:
+        """Reconstruct URL from binary expression (string concatenation)."""
+        if not hasattr(node, 'operator') or node.operator != '+':
+            return None
+            
+        left_val = self._extract_expression_value(node.left)
+        right_val = self._extract_expression_value(node.right)
+        
+        if left_val and right_val:
+            # Check if concatenated result looks like an endpoint
+            result = left_val + right_val
+            if self._is_likely_endpoint(result):
+                return result
+            return left_val + right_val
+        elif left_val and left_val.startswith('/'):
+            # If left side starts with '/', it's likely a base path
+            return left_val + '${...}'
+        elif right_val and (left_val == '' or left_val is None):
+            return '${...}' + right_val
+        elif left_val:
+            return left_val + '${...}'
+        elif right_val:
+            return '${...}' + right_val
+        
+        return None
+    
+    def _extract_expression_value(self, expr: Any) -> Optional[str]:
+        """Extract string value from various expression types."""
+        if not hasattr(expr, 'type'):
+            return None
+            
+        if expr.type == 'Literal':
+            return self._extract_literal_value(expr)
+        elif expr.type == 'Identifier':
+            var_name = expr.name
+            return self.variables.get(var_name) or self.constants.get(var_name)
+        elif expr.type == 'BinaryExpression':
+            return self._reconstruct_binary_expression(expr)
+        elif expr.type == 'TemplateLiteral':
+            return self._reconstruct_template_literal(expr)
+        
+        return None
+    
+    def _extract_from_object_expression(self, node: Any) -> None:
+        """Extract URLs from object expressions."""
+        if not hasattr(node, 'properties'):
+            return
+            
+        for prop in node.properties:
+            if (hasattr(prop, 'key') and hasattr(prop.key, 'name') and 
+                prop.key.name in ['url', 'href', 'endpoint', 'path']):
+                
+                if hasattr(prop, 'value'):
+                    url = self._extract_expression_value(prop.value)
+                    if url and self._is_likely_endpoint(url):
+                        self.endpoints.add(url)
+    
+    def _handle_variable_declaration(self, node: Any) -> None:
+        """Handle variable declarations to track URLs."""
+        if not hasattr(node, 'declarations'):
+            return
+            
+        for decl in node.declarations:
+            if hasattr(decl, 'id') and hasattr(decl.id, 'name') and hasattr(decl, 'init'):
+                var_name = decl.id.name
+                value = self._extract_expression_value(decl.init)
+                
+                if value:
+                    if hasattr(node, 'kind') and node.kind == 'const':
+                        self.constants[var_name] = value
+                    else:
+                        self.variables[var_name] = value
+                    
+                    # Check if it's a base URL
+                    if self._is_base_url(value):
+                        self.base_urls.add(value)
+                    
+                    # Check if the constructed value is an endpoint
+                    if self._is_likely_endpoint(value):
+                        self.endpoints.add(value)
+    
+    def _handle_assignment_expression(self, node: Any) -> None:
+        """Handle assignment expressions."""
+        if (hasattr(node, 'left') and hasattr(node.left, 'name') and 
+            hasattr(node, 'right')):
+            
+            var_name = node.left.name
+            value = self._extract_expression_value(node.right)
+            
+            if value:
+                self.variables[var_name] = value
+                
+                if self._is_base_url(value):
+                    self.base_urls.add(value)
+                
+                # Check if the constructed value is an endpoint
+                if self._is_likely_endpoint(value):
+                    self.endpoints.add(value)
+    
+    def _handle_member_expression(self, node: Any) -> None:
+        """Handle member expressions for potential API calls."""
+        # This is handled in _check_member_function_call
+        pass
+    
+    def _handle_concat_call(self, callee: Any, args: List[Any]) -> None:
+        """Handle string concatenation calls like '/api/'.concat(variable)."""
+        if not args:
+            return
+            
+        # Get the base string from the object being concat'd on
+        base_string = self._extract_expression_value(callee.object)
+        if not base_string:
+            return
+            
+        # Try to reconstruct the full concatenated string
+        result = base_string
+        for arg in args:
+            arg_val = self._extract_expression_value(arg)
+            if arg_val:
+                result += arg_val
+            else:
+                # If we can't resolve the argument, add a placeholder
+                result += '${...}'
+        
+        # Check if the result looks like an endpoint
+        if self._is_likely_endpoint(result):
+            self.endpoints.add(result)
+    
+    def _handle_new_expression(self, node: Any) -> None:
+        """Handle new expressions like new XMLHttpRequest()."""
+        if hasattr(node, 'callee') and hasattr(node.callee, 'name'):
+            if 'XMLHttpRequest' in node.callee.name:
+                # Track XHR instantiation - actual URLs come from .open() calls
+                pass
+    
+    def _is_likely_endpoint(self, url: str) -> bool:
+        """Check if a string is likely an API endpoint."""
+        if not isinstance(url, str) or len(url) < 2:
+            return False
+            
+        # Skip obvious non-endpoints
+        skip_patterns = [
+            r'^[a-zA-Z]+$',       # Just a word
+            r'^\d+$',             # Just numbers
+            r'^#',                # Hash fragments
+            r'^javascript:',      # JavaScript URLs
+            r'^mailto:',          # Email links
+            r'^tel:',             # Phone links
+            r'^data:',            # Data URLs
+            r'^wss?://',          # WebSocket URLs
+            r'^file://',          # File URLs
+            r'^/home/',           # Local file paths
+            r'^/usr/',            # System paths
+            r'^/var/',            # System paths
+            r'^[A-Z][a-zA-Z\s]+$', # Sentences/titles
+            r'@',                 # Email addresses
+            r'^\w+\.\w+$',        # Simple file names
+            r'^http://www\.w3\.org/', # W3 URLs (XML namespaces etc)
+            r'xmlns',             # XML namespace declarations
+            r'^https?://[^/]+/?$', # Just domains without paths (unless it's an API domain)
+        ]
+        
+        for pattern in skip_patterns:
+            if re.match(pattern, url):
+                return False
+        
+        # Positive indicators
+        positive_patterns = [
+            r'^https?://',      # Full URLs
+            r'^/api/',          # API paths
+            r'^/v\d+/',         # Versioned APIs
+            r'^/rest/',         # REST APIs
+            r'^/graphql',       # GraphQL endpoints
+            r'\.json$',         # JSON endpoints
+            r'\.xml$',          # XML endpoints
+            r'/users',          # User endpoints
+            r'/user/',          # User endpoints
+            r'/auth',           # Authentication endpoints
+            r'/login',          # Login endpoints
+            r'/logout',         # Logout endpoints
+            r'/profile',        # Profile endpoints
+            r'/settings',       # Settings endpoints
+            r'/config',         # Config endpoints
+            r'/data/',          # Data endpoints
+            r'/uploads/',       # Upload endpoints
+            r'/posts',          # Posts endpoints
+            r'/comments',       # Comments endpoints
+            r'/notifications',  # Notifications
+            r'/dashboard',      # Dashboard
+            r'/reports',        # Reports
+            r'/analytics',      # Analytics
+            r'\.php$',          # PHP endpoints
+            r'\.asp',           # ASP endpoints
+            r'/customers',      # Customers
+            r'/orders',         # Orders
+            r'/items',          # Items
+            r'/functional-pillars',  # Functional pillars
+            r'/collections',    # Collections
+            r'/classifications', # Classifications
+            r'/sso/',           # SSO endpoints
+            r'/meta',           # Meta endpoints
+        ]
+        
+        for pattern in positive_patterns:
+            if re.search(pattern, url, re.IGNORECASE):
+                return True
+        
+        # Check for path-like structure
+        if url.startswith('/') and len(url) > 1:
+            return True
+            
+        # Check for URL with domain - but be more specific
+        if url.startswith('https://') and '.' in url:
+            # Check if it's an API-looking domain or has a path
+            if ('api' in url.lower() or 'rest' in url.lower() or 
+                'graphql' in url.lower() or '/' in url[8:] or  # path after https://
+                any(word in url.lower() for word in ['login', 'auth', 'oauth'])):
+                return True
+        
+        return False
+    
+    def _is_base_url(self, url: str) -> bool:
+        """Check if a URL is likely a base URL."""
+        if not isinstance(url, str):
+            return False
+            
+        base_patterns = [
+            r'^https?://[^/]+/?$',  # Just domain
+            r'api\..*\.com',        # API domains
+            r'localhost:\d+',       # Local dev servers
+        ]
+        
+        for pattern in base_patterns:
+            if re.match(pattern, url, re.IGNORECASE):
+                return True
+        
+        return False
+
+
+def load_js_source(source: str, timeout: int = 15) -> str:
+    """
+    Load JavaScript source code from URL or file path.
+    
+    Args:
+        source: URL or file path to JavaScript file
+        
+    Returns:
+        JavaScript source code as string
+        
+    Raises:
+        Exception: If unable to load source
+    """
+    if source.startswith(('http://', 'https://')):
+        # Load from URL
+        try:
+            req = Request(source, headers={'User-Agent': 'EndpointExtractor/1.0'})
+            with urlopen(req, timeout=timeout) as response:
+                content = response.read()
+                
+                # Try to decode with common encodings
+                for encoding in ['utf-8', 'latin-1', 'cp1252']:
+                    try:
+                        return content.decode(encoding)
+                    except UnicodeDecodeError:
+                        continue
+                
+                # Fallback: decode with errors ignored
+                return content.decode('utf-8', errors='ignore')
+                
+        except URLError as e:
+            raise Exception(f"Failed to download {source}: {e}")
+        except Exception as e:
+            raise Exception(f"Error loading URL {source}: {e}")
+    else:
+        # Load from file
+        try:
+            with open(source, 'r', encoding='utf-8') as f:
+                return f.read()
+        except FileNotFoundError:
+            raise Exception(f"File not found: {source}")
+        except UnicodeDecodeError:
+            # Try with different encoding
+            try:
+                with open(source, 'r', encoding='latin-1') as f:
+                    return f.read()
+            except Exception as e:
+                raise Exception(f"Failed to read file {source}: {e}")
+        except Exception as e:
+            raise Exception(f"Error reading file {source}: {e}")
+
+
+def extract_api_endpoints(js_code: str) -> Dict[str, Any]:
+    """
+    Extract API endpoints from JavaScript code using AST analysis and regex fallback.
+    
+    Args:
+        js_code: JavaScript source code
+        
+    Returns:
+        Dict containing endpoints and metadata
+        
+    Raises:
+        Exception: If parsing fails
+    """
+    extractor = EndpointExtractor()
+    
+    try:
+        # Try to parse JavaScript code into AST
+        ast = esprima.parseScript(js_code, options={'tolerant': True, 'jsx': True})
+        result = extractor.extract_from_ast(ast)
+        
+        # If AST parsing found few or no endpoints, also try regex fallback
+        if result['total_count'] < 5:  # Arbitrary threshold
+            regex_endpoints = extractor.extract_from_source_regex(js_code)
+            # Merge with existing endpoints
+            all_endpoints = set(result['endpoints']) | regex_endpoints
+            result['endpoints'] = sorted(list(all_endpoints))
+            result['categorized'] = extractor._categorize_endpoints(result['endpoints'])
+            result['total_count'] = len(result['endpoints'])
+        
+        return result
+        
+    except Exception as e:
+        # Try parsing as module if script parsing fails
+        try:
+            ast = esprima.parseModule(js_code, options={'tolerant': True, 'jsx': True})
+            result = extractor.extract_from_ast(ast)
+            
+            # Also try regex fallback for modules
+            if result['total_count'] < 5:
+                regex_endpoints = extractor.extract_from_source_regex(js_code)
+                all_endpoints = set(result['endpoints']) | regex_endpoints
+                result['endpoints'] = sorted(list(all_endpoints))
+                result['categorized'] = extractor._categorize_endpoints(result['endpoints'])
+                result['total_count'] = len(result['endpoints'])
+            
+            return result
+        except Exception as e2:
+            # If both AST approaches fail, fall back to regex only
+            try:
+                regex_endpoints = extractor.extract_from_source_regex(js_code)
+                endpoints = sorted(list(regex_endpoints))
+                return {
+                    'endpoints': endpoints,
+                    'categorized': extractor._categorize_endpoints(endpoints),
+                    'base_urls': [],
+                    'total_count': len(endpoints)
+                }
+            except Exception as e3:
+                raise Exception(f"Failed to parse JavaScript: {e2}")
+
+
+def display_results(result: Dict[str, Any], source: str) -> None:
+    """Display results in a clean, traditional terminal format."""
+    
+    endpoints = result['endpoints']
+    categorized = result['categorized']
+    base_urls = result['base_urls']
+    total_count = result['total_count']
+    
+    # Header
+    print()
+    console.print(f"[bold blue]JavaScript API Endpoint Extractor[/bold blue]")
+    console.print(f"[dim]Source: {source}[/dim]")
+    print()
+    
+    if total_count == 0:
+        console.print("[yellow]✗ No API endpoints detected[/yellow]")
+        return
+    
+    # Summary
+    console.print(f"[green]✓ Found {total_count} endpoints in {len(categorized)} categories[/green]")
+    
+    if base_urls:
+        console.print(f"[cyan]→ Base URLs detected: {len(base_urls)}[/cyan]")
+        for url in base_urls:
+            console.print(f"  [dim]•[/dim] [cyan]{url}[/cyan]")
+    
+    print()
+    
+    # Category names (simplified)
+    category_names = {
+        'api_endpoints': 'API Endpoints',
+        'rest_endpoints': 'REST APIs', 
+        'graphql_endpoints': 'GraphQL',
+        'auth_endpoints': 'Authentication',
+        'static_resources': 'Static Resources',
+        'external_apis': 'External APIs',
+        'dynamic_endpoints': 'Dynamic Endpoints'
+    }
+    
+    # Display categorized endpoints
+    for category, endpoints_list in categorized.items():
+        if endpoints_list and category != 'local_development':  # Skip local dev
+            title = category_names.get(category, category.title())
+            
+            console.print(f"[bold]{title}[/bold] [dim]({len(endpoints_list)})[/dim]")
+            
+            for endpoint in endpoints_list:
+                # Color coding
+                if endpoint.startswith('https://'):
+                    console.print(f"  [green]{endpoint}[/green]")
+                elif endpoint.startswith('http://'):
+                    console.print(f"  [yellow]{endpoint}[/yellow]")
+                elif '${' in endpoint or '...' in endpoint:
+                    console.print(f"  [magenta]{endpoint}[/magenta]")
+                else:
+                    console.print(f"  [white]{endpoint}[/white]")
+            
+            print()
+    
+    # Simple summary list
+    console.print("[bold]All Endpoints:[/bold]")
+    for i, endpoint in enumerate(endpoints, 1):
+        console.print(f"{i:2d}. {endpoint}")
+    
+    print()
+
+
+def process_source(source: str, quiet: bool = False, timeout: int = 15) -> Dict[str, Any]:
+    """Process a single source (URL or file) and return results."""
+    try:
+        if not quiet:
+            console.print(f"[dim]Loading {source}...[/dim]", end=" ")
+        
+        js_code = load_js_source(source, timeout=timeout)
+        
+        if not quiet:
+            console.print(f"[green]✓[/green] [dim]({len(js_code):,} chars)[/dim]")
+        
+        if not quiet:
+            console.print("[dim]Analyzing JavaScript...[/dim]", end=" ")
+        
+        result = extract_api_endpoints(js_code)
+        result['source'] = source
+        
+        if not quiet:
+            console.print(f"[green]✓[/green]")
+        
+        return result
+        
+    except Exception as e:
+        error_msg = str(e)
+        if len(error_msg) > 100:
+            error_msg = error_msg[:97] + "..."
+        
+        if not quiet:
+            console.print(f"[red]❌ Error: {error_msg}[/red]")
+        
+        return {
+            'source': source,
+            'error': str(e),
+            'endpoints': [],
+            'categorized': {},
+            'base_urls': [],
+            'total_count': 0
+        }
+
+
+def read_sources_from_stdin() -> List[str]:
+    """Read sources from stdin, one per line."""
+    sources = []
+    try:
+        for line in sys.stdin:
+            source = line.strip()
+            if source and not source.startswith('#'):  # Skip empty lines and comments
+                sources.append(source)
+    except KeyboardInterrupt:
+        console.print("[yellow]\nInterrupted by user[/yellow]")
+        sys.exit(1)
+    return sources
+
+
+def merge_results(results: List[Dict[str, Any]], sources: List[str]) -> Dict[str, Any]:
+    """Merge multiple results into a single result."""
+    all_endpoints = set()
+    all_base_urls = set()
+    successful_sources = []
+    failed_sources = []
+    
+    for result in results:
+        if result and 'error' not in result:
+            all_endpoints.update(result['endpoints'])
+            all_base_urls.update(result['base_urls'])
+            successful_sources.append(result.get('source', 'unknown'))
+        elif result and 'error' in result:
+            failed_sources.append(result.get('source', 'unknown'))
+    
+    endpoints_list = sorted(list(all_endpoints))
+    extractor = EndpointExtractor()
+    
+    return {
+        'endpoints': endpoints_list,
+        'categorized': extractor._categorize_endpoints(endpoints_list),
+        'base_urls': sorted(list(all_base_urls)),
+        'total_count': len(endpoints_list),
+        'successful_sources': len(successful_sources),
+        'failed_sources': len(failed_sources),
+        'total_sources': len(sources)
+    }
+
+
+def process_sources_concurrently(sources: List[str], max_workers: int = 10, timeout: int = 15) -> List[Dict[str, Any]]:
+    """Process multiple sources concurrently with progress tracking."""
+    results = []
+    
+    if len(sources) == 1:
+        # Single source - process normally with full output
+        return [process_source(sources[0], quiet=False, timeout=timeout)]
+    
+    # Multiple sources - use concurrent processing with progress bar
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        console=console
+    ) as progress:
+        
+        task = progress.add_task(f"Processing {len(sources)} sources...", total=len(sources))
+        
+        with ThreadPoolExecutor(max_workers=min(max_workers, len(sources))) as executor:
+            # Submit all tasks
+            future_to_source = {
+                executor.submit(process_source, source, quiet=True, timeout=timeout): source 
+                for source in sources
+            }
+            
+            # Collect results as they complete
+            for future in as_completed(future_to_source):
+                source = future_to_source[future]
+                try:
+                    result = future.result()
+                    results.append(result)
+                    
+                    # Update progress with status
+                    if result and 'error' not in result:
+                        progress.console.print(f"[green]✓[/green] [dim]{source}[/dim] - {result['total_count']} endpoints")
+                    else:
+                        progress.console.print(f"[red]✗[/red] [dim]{source}[/dim] - Error")
+                        
+                except Exception as e:
+                    console.print(f"[red]✗[/red] [dim]{source}[/dim] - {str(e)[:50]}...")
+                    results.append({
+                        'source': source,
+                        'error': str(e),
+                        'endpoints': [],
+                        'categorized': {},
+                        'base_urls': [],
+                        'total_count': 0
+                    })
+                
+                progress.advance(task)
+    
+    return results
+
+
+def output_json_format(result: Dict[str, Any]) -> None:
+    """Output results in JSON format for programmatic consumption."""
+    # Clean result for JSON output
+    json_result = {
+        'endpoints': result['endpoints'],
+        'categorized': result['categorized'],
+        'base_urls': result['base_urls'],
+        'total_count': result['total_count'],
+        'metadata': {
+            'successful_sources': result.get('successful_sources', 1),
+            'failed_sources': result.get('failed_sources', 0),
+            'total_sources': result.get('total_sources', 1)
+        }
+    }
+    print(json.dumps(json_result, indent=2))
+
+
+def main():
+    """Main entry point."""
+    parser = argparse.ArgumentParser(
+        description='Extract API endpoints from JavaScript files/URLs with optimized batch processing',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""Examples:
+  %(prog)s app.js
+  %(prog)s https://example.com/js/main.js
+  %(prog)s file1.js file2.js file3.js
+  echo "https://example.com/js/main.js" | %(prog)s -
+  cat urls.txt | %(prog)s -
+  cat urls.txt | %(prog)s - --json > endpoints.json
+  %(prog)s - --workers 20 --timeout 10 < large_urls.txt"""
+    )
+    
+    parser.add_argument('sources', nargs='*', 
+                       help='JavaScript files or URLs to analyze (use "-" to read from stdin)')
+    parser.add_argument('--json', action='store_true',
+                       help='Output results in JSON format')
+    parser.add_argument('--workers', type=int, default=10, metavar='N',
+                       help='Number of concurrent workers for batch processing (default: 10)')
+    parser.add_argument('--timeout', type=int, default=15, metavar='SECONDS',
+                       help='Timeout for each URL request in seconds (default: 15)')
+    parser.add_argument('--quiet', action='store_true',
+                       help='Suppress progress output (useful for large batches)')
+    
+    args = parser.parse_args()
+    
+    # Determine sources
+    if not args.sources or (len(args.sources) == 1 and args.sources[0] == '-'):
+        # Read from stdin
+        if not args.sources:
+            console.print("[red]Usage: python extract_endpoints.py <sources...> or use '-' to read from stdin[/red]")
+            sys.exit(1)
+            
+        if not args.quiet:
+            console.print("[dim]Reading sources from stdin...[/dim]")
+        sources = read_sources_from_stdin()
+        
+        if not sources:
+            console.print("[yellow]No sources provided via stdin[/yellow]")
+            sys.exit(1)
+            
+        if not args.quiet:
+            console.print(f"[dim]Processing {len(sources)} sources with {args.workers} workers...[/dim]")
+    else:
+        sources = args.sources
+    
+    # Handle console output mode
+    if args.quiet or args.json:
+        # Redirect console output for quiet/json mode
+        output_console = Console(file=sys.stderr if args.json else sys.stdout, quiet=args.quiet)
+    else:
+        output_console = console
+    
+    results = process_sources_concurrently(sources, max_workers=args.workers, timeout=args.timeout)
+    
+    # Filter successful results
+    valid_results = [r for r in results if r and 'error' not in r]
+    
+    if not valid_results:
+        if not args.quiet:
+            console.print("[red]No sources could be processed successfully[/red]")
+        sys.exit(1)
+    
+    # Handle output based on number of sources
+    if len(sources) == 1 and valid_results:
+        # Single source
+        result = valid_results[0]
+        if args.json:
+            output_json_format(result)
+        else:
+            display_results(result, sources[0])
+    else:
+        # Multiple sources - merge results
+        merged_result = merge_results(results, sources)
+        
+        if args.json:
+            output_json_format(merged_result)
+        else:
+            if not args.quiet:
+                console.print(f"\n[bold blue]Combined Results[/bold blue]")
+                console.print(f"[dim]Processed: {merged_result.get('successful_sources', 0)}/{merged_result.get('total_sources', len(sources))} sources[/dim]")
+            display_results(merged_result, f"{merged_result.get('successful_sources', 0)} sources")
+
+
+if __name__ == '__main__':
+    main()
