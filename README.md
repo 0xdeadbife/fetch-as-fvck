@@ -20,14 +20,14 @@
 
 1. **Clone the repository:**
    ```bash
-   git clone <your-repo-url>
+   git clone https://github.com/0xdeadbife/fetch-as-fvck.git
    cd fetch-as-fvck
    ```
 
 2. **Create and activate virtual environment:**
    ```bash
    python3 -m venv env
-   source env/bin/activate  # On Windows: env\Scripts\activate
+   source env/bin/activate
    ```
 
 3. **Install dependencies:**
