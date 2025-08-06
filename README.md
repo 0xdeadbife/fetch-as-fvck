@@ -1,9 +1,14 @@
-# 🔍 JavaScript API Endpoint Extractor
 
-A powerful tool for extracting API endpoints from JavaScript code using the esprima2 parser. Perfect for security analysis, API discovery, and code auditing.
+<h1 align="center">
+  <img src="static/logo.png" alt="fetch-as-fvck" width="320px">
+</h1>
 
 [![Python 3.7+](https://img.shields.io/badge/python-3.7+-blue.svg)](https://www.python.org/downloads/)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+
+`fetch-as-fvck` extracts real API endpoints from JS files (local or remote) using AST parsing — not dumb regex. Framework-aware, fast, and accurate. Perfect for bug bounty, recon, and code audits. No false positives. Just real fetches.
+
+---
 
 ## 🚀 Quick Start
 
@@ -16,7 +21,7 @@ A powerful tool for extracting API endpoints from JavaScript code using the espr
 1. **Clone the repository:**
    ```bash
    git clone <your-repo-url>
-   cd endpoint-extractor-tool
+   cd fetch-as-fvck
    ```
 
 2. **Create and activate virtual environment:**
@@ -35,27 +40,27 @@ A powerful tool for extracting API endpoints from JavaScript code using the espr
 ### Single File Analysis
 ```bash
 # Analyze local JavaScript file
-python extract_endpoints.py app.js
+python fetch-as-fvck app.js
 
 # Analyze remote JavaScript file
-python extract_endpoints.py https://example.com/js/main.js
+python fetch-as-fvck https://example.com/js/main.js
 ```
 
 ### Multiple Files
 ```bash
 # Process multiple files at once
-python extract_endpoints.py file1.js file2.js file3.js
+python fetch-as-fvck file1.js file2.js file3.js
 ```
 
 ### Batch Processing
 ```bash
 # Process URLs from stdin (optimized for large batches)
-cat urls.txt | python extract_endpoints.py -
-echo "https://example.com/app.js" | python extract_endpoints.py -
+cat urls.txt | python fetch-as-fvck -
+echo "https://example.com/app.js" | python fetch-as-fvck -
 
 # Advanced batch processing with custom settings
-cat large_url_list.txt | python extract_endpoints.py - --workers 20 --timeout 10
-python extract_endpoints.py - --json --quiet < urls.txt > endpoints.json
+cat large_url_list.txt | python fetch-as-fvck - --workers 20 --timeout 10
+python fetch-as-fvck - --json --quiet < urls.txt > endpoints.json
 ```
 
 ### ⚙️ Advanced Options
@@ -70,13 +75,13 @@ python extract_endpoints.py - --json --quiet < urls.txt > endpoints.json
 **Examples:**
 ```bash
 # High-performance batch processing
-cat large_urls.txt | python extract_endpoints.py - --workers 50 --timeout 5 --quiet --json > results.json
+cat large_urls.txt | python fetch-as-fvck - --workers 50 --timeout 5 --quiet --json > results.json
 
 # Custom worker count
-cat urls.txt | python extract_endpoints.py - --workers 20
+cat urls.txt | python fetch-as-fvck - --workers 20
 
 # JSON output
-cat urls.txt | python extract_endpoints.py - --json
+cat urls.txt | python fetch-as-fvck - --json
 ```
 
 ## ✨ Features

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-JavaScript API Endpoint Extractor
+fetch-as-fvck
 
 A framework-agnostic tool to extract API endpoints and HTTP requests from JavaScript code
 using esprima2 for AST analysis. Supports modern frameworks and libraries.
@@ -14,16 +14,16 @@ Features:
 - Filters out false positives (non-HTTP URLs, file paths, etc.)
 
 Usage:
-    python extract_endpoints.py <url_or_file.js> [url_or_file2.js ...]
-    python extract_endpoints.py -
-    echo "https://example.com/js/main.js" | python extract_endpoints.py -
+    python fetch-as-fvck <url_or_file.js> [url_or_file2.js ...]
+    python fetch-as-fvck -
+    echo "https://example.com/js/main.js" | python fetch-as-fvck -
 
 Examples:
-    python extract_endpoints.py app.js
-    python extract_endpoints.py https://example.com/js/main.js
-    python extract_endpoints.py file1.js file2.js file3.js
-    echo "https://example.com/js/main.js" | python extract_endpoints.py -
-    cat urls.txt | python extract_endpoints.py -
+    python fetch-as-fvck app.js
+    python fetch-as-fvck https://example.com/js/main.js
+    python fetch-as-fvck file1.js file2.js file3.js
+    echo "https://example.com/js/main.js" | python fetch-as-fvck -
+    cat urls.txt | python fetch-as-fvck -
 """
 
 import sys
@@ -688,7 +688,7 @@ def load_js_source(source: str, timeout: int = 15) -> str:
     if source.startswith(('http://', 'https://')):
         # Load from URL
         try:
-            req = Request(source, headers={'User-Agent': 'EndpointExtractor/1.0'})
+            req = Request(source, headers={'User-Agent': 'fetch-as-fvck/1.0'})
             with urlopen(req, timeout=timeout) as response:
                 content = response.read()
                 
@@ -795,7 +795,7 @@ def display_results(result: Dict[str, Any], source: str) -> None:
     
     # Header
     print()
-    console.print(f"[bold blue]JavaScript API Endpoint Extractor[/bold blue]")
+    console.print(f"[bold blue]fetch-as-fvck[/bold blue]")
     console.print(f"[dim]Source: {source}[/dim]")
     print()
     
@@ -1037,7 +1037,7 @@ def main():
     if not args.sources or (len(args.sources) == 1 and args.sources[0] == '-'):
         # Read from stdin
         if not args.sources:
-            console.print("[red]Usage: python extract_endpoints.py <sources...> or use '-' to read from stdin[/red]")
+            console.print("[red]Usage: python fetch-as-fvck <sources...> or use '-' to read from stdin[/red]")
             sys.exit(1)
             
         if not args.quiet:
