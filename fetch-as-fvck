@@ -69,6 +69,7 @@ class EndpointExtractor:
         self.constants: Dict[str, str] = {}  # Track const declarations
         self.base_urls: Set[str] = set()  # Track base URLs
         self.api_calls: List[Dict[str, Any]] = []  # Track API calls with context
+        self.context_stack: List[Dict[str, Any]] = []  # Track AST context for semantic analysis
         
         # Common API-related patterns
         self.api_patterns = {
@@ -179,28 +180,37 @@ class EndpointExtractor:
         # Remove empty categories
         return {k: v for k, v in categories.items() if v}
     
-    def _traverse_node(self, node: Any) -> None:
-        """Recursively traverse AST nodes."""
+    def _traverse_node(self, node: Any, context: Dict[str, Any] = None) -> None:
+        """Recursively traverse AST nodes with context tracking."""
         if not hasattr(node, 'type'):
             return
-            
-        # Handle different node types
-        if node.type == 'CallExpression':
-            self._handle_call_expression(node)
-        elif node.type == 'VariableDeclaration':
-            self._handle_variable_declaration(node)
-        elif node.type == 'AssignmentExpression':
-            self._handle_assignment_expression(node)
-        elif node.type == 'MemberExpression':
-            self._handle_member_expression(node)
-        elif node.type == 'NewExpression':
-            self._handle_new_expression(node)
-        elif node.type == 'Literal':
-            # Check literal strings for potential endpoints
-            self._check_literal_for_endpoint(node)
         
-        # Traverse child nodes using proper AST structure
-        self._traverse_children(node)
+        # Push context onto stack
+        if context:
+            self.context_stack.append(context)
+        
+        try:
+            # Handle different node types
+            if node.type == 'CallExpression':
+                self._handle_call_expression(node)
+            elif node.type == 'VariableDeclaration':
+                self._handle_variable_declaration(node)
+            elif node.type == 'AssignmentExpression':
+                self._handle_assignment_expression(node)
+            elif node.type == 'MemberExpression':
+                self._handle_member_expression(node)
+            elif node.type == 'NewExpression':
+                self._handle_new_expression(node)
+            elif node.type == 'Literal':
+                # Check literal strings for potential endpoints
+                self._check_literal_for_endpoint(node)
+            
+            # Traverse child nodes using proper AST structure
+            self._traverse_children(node)
+        finally:
+            # Pop context from stack
+            if context and self.context_stack:
+                self.context_stack.pop()
     
     def _traverse_children(self, node: Any) -> None:
         """Traverse child nodes properly."""
@@ -275,8 +285,160 @@ class EndpointExtractor:
         """Check if a literal value is a potential endpoint."""
         if hasattr(node, 'value') and isinstance(node.value, str):
             url = node.value
-            if self._is_likely_endpoint(url):
+            if self._analyze_string_patterns_ast(node):
                 self.endpoints.add(url)
+            elif self._is_likely_endpoint(url):
+                self.endpoints.add(url)
+    
+    def _analyze_string_patterns_ast(self, node: Any) -> bool:
+        """Analyze string patterns using AST context instead of hardcoded regex."""
+        if not hasattr(node, 'value') or not isinstance(node.value, str):
+            return False
+            
+        url = node.value
+        
+        # Basic structural analysis - check if it looks path-like
+        if '/' in url and len(url.split('/')) >= 2:
+            # Check if this could be an endpoint based on AST context
+            return self._is_contextual_endpoint(node, url)
+            
+        # Check for other endpoint patterns based on structure
+        if any(pattern in url.lower() for pattern in ['.json', '.xml', '.api', 'graphql']):
+            return self._is_contextual_endpoint(node, url)
+            
+        return False
+    
+    def _is_contextual_endpoint(self, node: Any, url: str) -> bool:
+        """Determine if a URL is an endpoint based on AST context."""
+        # First, apply basic filtering to reject obvious non-endpoints
+        if self._is_obvious_non_endpoint(url):
+            return False
+            
+        # Check immediate context in context stack
+        current_context = self.context_stack[-1] if self.context_stack else {}
+        
+        # Context indicators that suggest this is an API endpoint
+        api_context_indicators = [
+            'fetch_call',           # Inside fetch() call
+            'axios_call',           # Inside axios call
+            'ajax_call',            # Inside AJAX call
+            'xhr_call',             # Inside XMLHttpRequest
+            'http_method_call',     # Inside HTTP method call
+            'request_config',       # Inside request configuration object
+            'url_property',         # As value of 'url' property
+            'endpoint_property',    # As value of 'endpoint' property
+            'api_base_concat'       # String concatenation with API base
+        ]
+        
+        context_type = current_context.get('type', '')
+        if context_type in api_context_indicators:
+            return True
+        
+        # Check if this literal is an argument to an HTTP-related function
+        if self._is_in_http_function_context():
+            return True
+            
+        # Check if this is part of a URL concatenation with API indicators
+        if self._is_api_url_concatenation(url):
+            return True
+            
+        # Check variable assignment context
+        if current_context.get('assignment_context'):
+            var_name = current_context.get('variable_name', '').lower()
+            if any(indicator in var_name for indicator in ['url', 'endpoint', 'api', 'path', 'route']):
+                return self._has_endpoint_structure(url)
+        
+        # Check property assignment context
+        if current_context.get('property_context'):
+            prop_name = current_context.get('property_name', '').lower()
+            if prop_name in ['url', 'href', 'endpoint', 'path', 'route', 'action']:
+                return self._has_endpoint_structure(url)
+        
+        # Structural analysis: if URL has API-like structure, it's likely an endpoint
+        url_lower = url.lower()
+        if (url.startswith('/') and 
+            any(segment in url_lower for segment in ['api', 'rest', 'graphql', 'auth', 'user', 'admin'])):
+            return True
+            
+        return False
+    
+    def _is_obvious_non_endpoint(self, url: str) -> bool:
+        """Check if a URL is obviously not an endpoint."""
+        # File system paths
+        if url.startswith(('/home/', '/usr/', '/var/', '/etc/', '/opt/')):
+            return True
+        
+        # Static assets (images, CSS, JS files, etc.)
+        static_extensions = ['.png', '.jpg', '.jpeg', '.gif', '.svg', '.css', '.js', '.ico', '.woff', '.woff2', '.ttf']
+        if any(url.lower().endswith(ext) for ext in static_extensions):
+            return True
+        
+        # Static asset paths
+        if any(path in url.lower() for path in ['/static/', '/assets/', '/images/', '/css/', '/js/', '/fonts/']):
+            return True
+        
+        # Single words without proper path structure
+        if '/' not in url and len(url.split('.')) == 1 and not url.startswith('http'):
+            return True
+        
+        # Paths ending with just slash (like 'users/')
+        if url.endswith('/') and '/' not in url[:-1] and not url.startswith('/'):
+            return True
+            
+        # Email addresses
+        if '@' in url and '.' in url:
+            return True
+            
+        # Pure numbers or very short strings
+        if len(url) < 2 or url.isdigit():
+            return True
+            
+        # JavaScript URLs and other protocols
+        if url.startswith(('javascript:', 'mailto:', 'tel:', 'data:')):
+            return True
+            
+        return False
+    
+    def _has_endpoint_structure(self, url: str) -> bool:
+        """Check if a URL has the structure of an API endpoint."""
+        # Must be a path or full URL
+        if not (url.startswith('/') or url.startswith('http')):
+            return False
+            
+        # Should have some path structure
+        if url.count('/') < 1:
+            return False
+            
+        # Check for API indicators
+        url_lower = url.lower()
+        api_indicators = ['api', 'rest', 'graphql', 'auth', 'user', 'admin', 'v1', 'v2', 'v3']
+        return any(indicator in url_lower for indicator in api_indicators)
+    
+    def _is_in_http_function_context(self) -> bool:
+        """Check if we're currently inside an HTTP-related function call."""
+        for context in reversed(self.context_stack):
+            if context.get('type') in ['fetch_call', 'axios_call', 'ajax_call', 'xhr_call']:
+                return True
+            if context.get('function_name') in ['fetch', 'get', 'post', 'put', 'delete', 'patch', 'ajax']:
+                return True
+        return False
+    
+    def _is_api_url_concatenation(self, url: str) -> bool:
+        """Check if this URL is part of an API URL concatenation."""
+        # Look for patterns where this URL segment suggests API usage
+        url_segments = url.split('/')
+        api_segments = ['api', 'v1', 'v2', 'v3', 'rest', 'graphql', 'auth', 'oauth', 'login', 'users', 'admin']
+        
+        for segment in url_segments:
+            if segment.lower() in api_segments:
+                return True
+                
+        # Check if any tracked base URLs suggest this is an API extension
+        for base_url in self.base_urls:
+            if 'api' in base_url.lower() and url.startswith('/'):
+                return True
+                
+        return False
     
     def _handle_call_expression(self, node: Any) -> None:
         """Handle function call expressions."""
@@ -286,9 +448,16 @@ class EndpointExtractor:
         callee = node.callee
         args = getattr(node, 'arguments', [])
         
+        # Determine context for arguments based on function being called
+        context_type = self._determine_call_context(callee)
+        
         # Direct function calls like fetch()
         if hasattr(callee, 'name'):
             self._check_direct_function_call(callee.name, args)
+            # Traverse arguments with context
+            if context_type:
+                for arg in args:
+                    self._traverse_node(arg, {'type': context_type, 'function_name': callee.name})
         
         # Member expressions like axios.get(), $.ajax(), string.concat()
         elif hasattr(callee, 'type') and callee.type == 'MemberExpression':
@@ -296,6 +465,38 @@ class EndpointExtractor:
             # Special handling for .concat() method calls
             if hasattr(callee, 'property') and hasattr(callee.property, 'name') and callee.property.name == 'concat':
                 self._handle_concat_call(callee, args)
+            # Traverse arguments with context
+            elif context_type:
+                method_name = getattr(callee.property, 'name', '') if hasattr(callee, 'property') else ''
+                for arg in args:
+                    self._traverse_node(arg, {'type': context_type, 'method_name': method_name})
+    
+    def _determine_call_context(self, callee: Any) -> str:
+        """Determine the context type for a function call."""
+        # Direct function calls
+        if hasattr(callee, 'name'):
+            func_name = callee.name
+            if func_name == 'fetch':
+                return 'fetch_call'
+            elif func_name in self.api_patterns['react_hooks']:
+                return 'http_method_call'
+        
+        # Member expression calls
+        elif hasattr(callee, 'type') and callee.type == 'MemberExpression':
+            if hasattr(callee, 'property') and hasattr(callee.property, 'name'):
+                method_name = callee.property.name
+                object_name = self._get_object_name(callee.object)
+                
+                if self._is_axios_call(object_name, method_name):
+                    return 'axios_call'
+                elif self._is_jquery_call(object_name, method_name):
+                    return 'ajax_call'
+                elif self._is_xhr_call(object_name, method_name):
+                    return 'xhr_call'
+                elif method_name in ['get', 'post', 'put', 'delete', 'patch', 'head', 'options']:
+                    return 'http_method_call'
+        
+        return ''
     
     def _check_direct_function_call(self, func_name: str, args: List[Any]) -> None:
         """Check direct function calls for API patterns."""
@@ -486,6 +687,14 @@ class EndpointExtractor:
                 prop.key.name in ['url', 'href', 'endpoint', 'path']):
                 
                 if hasattr(prop, 'value'):
+                    # Traverse property value with property context
+                    prop_context = {
+                        'type': 'url_property' if prop.key.name == 'url' else 'endpoint_property',
+                        'property_context': True,
+                        'property_name': prop.key.name
+                    }
+                    self._traverse_node(prop.value, prop_context)
+                    
                     url = self._extract_expression_value(prop.value)
                     if url and self._is_likely_endpoint(url):
                         self.endpoints.add(url)
@@ -498,6 +707,15 @@ class EndpointExtractor:
         for decl in node.declarations:
             if hasattr(decl, 'id') and hasattr(decl.id, 'name') and hasattr(decl, 'init'):
                 var_name = decl.id.name
+                
+                # Traverse init expression with assignment context
+                assignment_context = {
+                    'type': 'assignment_context',
+                    'assignment_context': True,
+                    'variable_name': var_name
+                }
+                self._traverse_node(decl.init, assignment_context)
+                
                 value = self._extract_expression_value(decl.init)
                 
                 if value:
@@ -568,28 +786,36 @@ class EndpointExtractor:
                 # Track XHR instantiation - actual URLs come from .open() calls
                 pass
     
-    def _is_likely_endpoint(self, url: str) -> bool:
-        """Check if a string is likely an API endpoint."""
+    def _is_likely_endpoint(self, url: str, use_context: bool = True) -> bool:
+        """Check if a string is likely an API endpoint using contextual analysis."""
         if not isinstance(url, str) or len(url) < 2:
             return False
+        
+        # If we have context available, use contextual analysis first
+        if use_context and self.context_stack:
+            # Create a dummy node for contextual analysis
+            dummy_node = type('Node', (), {'value': url, 'type': 'Literal'})()
+            if self._is_contextual_endpoint(dummy_node, url):
+                return True
+        
+        # Fallback to regex-based analysis
+        return self._is_likely_endpoint_regex(url)
+    
+    def _is_likely_endpoint_regex(self, url: str) -> bool:
+        """Original regex-based endpoint detection as fallback."""
+        if not isinstance(url, str) or len(url) < 2:
+            return False
+        
+        # Use the same filtering logic as contextual analysis
+        if self._is_obvious_non_endpoint(url):
+            return False
             
-        # Skip obvious non-endpoints
+        # Skip obvious non-endpoints (additional regex patterns)
         skip_patterns = [
             r'^[a-zA-Z]+$',       # Just a word
-            r'^\d+$',             # Just numbers
             r'^#',                # Hash fragments
-            r'^javascript:',      # JavaScript URLs
-            r'^mailto:',          # Email links
-            r'^tel:',             # Phone links
-            r'^data:',            # Data URLs
-            r'^wss?://',          # WebSocket URLs
-            r'^file://',          # File URLs
-            r'^/home/',           # Local file paths
-            r'^/usr/',            # System paths
-            r'^/var/',            # System paths
             r'^[A-Z][a-zA-Z\s]+$', # Sentences/titles
-            r'@',                 # Email addresses
-            r'^\w+\.\w+$',        # Simple file names
+            r'^\w+\.\w+$',        # Simple file names like 'file.txt'
             r'^http://www\.w3\.org/', # W3 URLs (XML namespaces etc)
             r'xmlns',             # XML namespace declarations
             r'^https?://[^/]+/?$', # Just domains without paths (unless it's an API domain)

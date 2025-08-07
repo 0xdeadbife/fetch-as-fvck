@@ -3,10 +3,11 @@
   <img src="static/logo.png" alt="fetch-as-fvck" width="320px">
 </h1>
 
+[![AI Assisted](https://img.shields.io/badge/AI%20Assisted-Claude%20%F0%9F%A7%A0-blue.svg)](https://claude.ai)
 [![Python 3.7+](https://img.shields.io/badge/python-3.7+-blue.svg)](https://www.python.org/downloads/)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
-`fetch-as-fvck` extracts real API endpoints from JS files (local or remote) using AST parsing — not dumb regex. Framework-aware, fast, and accurate. Perfect for bug bounty, recon, and code audits. No false positives. Just real fetches.
+`fetch-as-fvck` extracts real API endpoints from JS files (local or remote) using **semantic AST analysis** — not dumb regex. Uses JavaScript context to intelligently identify endpoints in `fetch()`, `axios`, `$.ajax()` and other HTTP calls. Framework-aware, fast, and accurate with minimal false positives. Perfect for bug bounty, recon, and code audits.
 
 ---
 
@@ -86,10 +87,17 @@ cat urls.txt | python fetch-as-fvck - --json
 
 ## ✨ Features
 
+### 🧠 Intelligent Detection
+- **Semantic Analysis**: Uses AST context to understand when strings are actually API endpoints
+- **Context-Aware**: Distinguishes between `/api/users` in `fetch()` vs `/home/user/file.txt` in other contexts
+- **Smart Filtering**: Automatically filters out static assets, file paths, and obvious non-endpoints
+- **Variable Resolution**: Tracks variable assignments like `const apiUrl = '/api/users'`
+
 ### 🎯 Framework & Library Support
 - **JavaScript Frameworks**: React, Vue.js, Angular, jQuery
-- **HTTP Libraries**: axios, fetch, XMLHttpRequest, superagent, ky
-- **Smart Detection**: Variables, template literals, dynamic URLs
+- **HTTP Libraries**: axios, fetch, XMLHttpRequest, superagent, ky, got
+- **Modern Patterns**: Template literals, string concatenation, object configurations
+- **React Hooks**: useFetch, useQuery, useMutation, useApi
 
 ### 🚀 Performance
 - **Concurrent Processing**: Multi-threaded URL processing
@@ -103,6 +111,54 @@ cat urls.txt | python fetch-as-fvck - --json
 - **Quiet Mode**: Minimal output for large batch operations
 - **Configurable Timeouts**: Adjustable request timeouts
 
+## 🎯 What It Detects
+
+### ✅ API Endpoints (Context-Aware Detection)
+```javascript
+// These are correctly identified as API endpoints
+fetch('/api/users');                    // Direct fetch call
+axios.get('/api/posts/123');           // Axios method
+$.ajax({url: '/rest/data'});           // jQuery AJAX
+xhr.open('GET', '/graphql/users');     // XMLHttpRequest
+
+// Variable assignments with API context
+const userEndpoint = '/api/profile';   // API-related variable name
+const config = {url: '/auth/token'};   // Object property
+
+// Template literals and concatenation
+fetch(`/api/users/${userId}`);         // Dynamic endpoint
+const endpoint = '/api/' + 'users';    // String concatenation
+```
+
+### ❌ Non-Endpoints (Intelligently Filtered)
+```javascript
+// These are correctly ignored
+const filePath = '/home/user/file.txt';    // File system path
+const image = '/static/images/logo.png';   // Static asset
+const title = 'User Profile Page';         // Regular text
+const email = 'user@example.com';          // Email address
+const jsCode = 'javascript:void(0)';       // JavaScript URL
+```
+
+### 📊 Sample Output
+```
+✓ Found 8 endpoints in 3 categories
+
+API Endpoints (5)
+  /api/users
+  /api/posts/123
+  /api/profile
+  /rest/data
+  /api/users/${...}
+
+Authentication (2)
+  /auth/token
+  /oauth/login
+
+GraphQL (1)
+  /graphql/users
+```
+
 ## 📁 Example Files
 
 | File | Description |
@@ -110,6 +166,23 @@ cat urls.txt | python fetch-as-fvck - --json
 | `test_sample.js` | Simple test file with basic API calls |
 | `comprehensive_test.js` | Complex test file with multiple frameworks and patterns |
 | `sample_urls.txt` | Example URL list for batch processing |
+
+## 🔧 How It Works
+
+### Semantic AST Analysis
+Unlike traditional regex-based tools, `fetch-as-fvck` parses JavaScript into an Abstract Syntax Tree (AST) and analyzes the semantic context of each string:
+
+1. **Context Tracking**: Maintains a context stack during AST traversal to understand where each string appears
+2. **Function Call Analysis**: Identifies when strings are arguments to HTTP-related functions (`fetch`, `axios.get`, etc.)
+3. **Variable Resolution**: Tracks variable assignments and resolves them in API contexts
+4. **Object Property Detection**: Recognizes strings as endpoints when they're values of URL-related properties
+5. **Intelligent Filtering**: Uses both contextual and structural analysis to filter out obvious non-endpoints
+
+### Why This Approach Works Better
+- **Precision**: Understands the difference between `'/api/users'` in `fetch()` vs `'/home/users'` in a file path
+- **Completeness**: Finds endpoints in variable assignments and object configurations that regex tools miss  
+- **Reduced False Positives**: Context-aware filtering eliminates static assets, system paths, and unrelated strings
+- **Framework Awareness**: Recognizes patterns specific to popular JavaScript frameworks and libraries
 
 ## 🤝 Contributing
 
